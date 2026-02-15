@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+High-Performance Audio Converter (Ryzen 9 7950X3D Optimization)
+===============================================================
+Combines robust metadata tracking with high-throughput parallel processing.
+- Threads: 28 concurrent workers
+- Memory Limit: Safe for ~150GB (uses stream processing to minimize footprint)
+- Engine: Direct FFmpeg subprocess (low overhead)
+- Database: SQLite with WAL mode for concurrent writes
+
+Dependencies: ffmpeg (system), tqdm (pip install tqdm)
+"""
+
+import os
+import sys
+import json
+import time
+import shutil
+import sqlite3
+import zipfile
+import hashlib
+import logging
+import subprocess
+import traceback
+import threading
+from pathlib import Path
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+from typing import Optional, Dict, Tuple, Any
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+# Hardware Optimization
+MAX_WORKERS = 28  # Targeted for Ryzen 9 7950X3D (leaving 4 threads for OS/IO)
+
+INPUT_DIR = Path("audio-inputs")
+OUTPUT_DIR = Path("audio-wav-files")
+ZIP_DIR = Path("audio-zips")
+DB_PATH = Path("audio_conversion.db")
+MAX_ZIP_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
+
+# Audio extensions to scan
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".aiff",
+    ".aif", ".opus", ".webm", ".mp4", ".amr", ".ape", ".ac3", ".dts",
+    ".mka", ".mpc", ".oga", ".spx", ".tta", ".voc", ".wv",
+}
+
+RUN_START = datetime.now(timezone.utc)
+RUN_STAMP = RUN_START.strftime("%y.%m.%d_%H%M")
+LOG_FILE = Path(f"conversion_log_{RUN_STAMP}.txt")
+
+# ── Logging setup ────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("audio_pipeline")
+
+# Thread-safe lock for DB writes
+db_lock = threading.Lock()
+
+# ── Database ─────────────────────────────────────────────────────────────────
+
+def init_db(db_path: Path):
+    """Initialize DB with robust schema from Script A, tailored for concurrency."""
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for concurrency
+    conn.execute("PRAGMA synchronous=NORMAL")
+    
+    with db_lock:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_path TEXT UNIQUE NOT NULL,
+                output_path TEXT,
+                filename TEXT,
+                status TEXT NOT NULL,
+                error_log TEXT,
+                old_size_bytes INTEGER,
+                old_format TEXT,
+                old_codec TEXT,
+                old_sample_rate INTEGER,
+                old_bit_depth TEXT,
+                old_channels INTEGER,
+                old_duration_sec REAL,
+                new_size_bytes INTEGER,
+                new_format TEXT,
+                new_codec TEXT,
+                new_sample_rate INTEGER,
+                new_bit_depth INTEGER,
+                new_channels INTEGER,
+                new_duration_sec REAL,
+                conversion_timestamp TEXT,
+                sha256_input TEXT,
+                sha256_output TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS zip_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                zip_name TEXT NOT NULL,
+                parent_folder TEXT NOT NULL,
+                zip_index INTEGER NOT NULL,
+                size_bytes INTEGER,
+                file_count INTEGER,
+                manifest_name TEXT,
+                run_timestamp TEXT
+            )
+        """)
+        conn.commit()
+    conn.close()
+
+def get_db_connection():
+    """Return a thread-local connection."""
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def is_already_converted(rel_input: str) -> bool:
+    with db_lock:
+        # Quick check using a temporary connection or shared state if possible
+        # For simplicity/safety with threading, we open a quick conn
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.execute(
+            "SELECT status FROM conversions WHERE input_path = ?", (rel_input,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None and row[0] == "success"
+
+def upsert_record(record: Dict):
+    """Thread-safe insert/update."""
+    cols = ", ".join(record.keys())
+    placeholders = ", ".join(["?"] * len(record))
+    updates = ", ".join(f"{k}=excluded.{k}" for k in record.keys() if k != "input_path")
+    
+    with db_lock:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            f"INSERT INTO conversions ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(input_path) DO UPDATE SET {updates}",
+            list(record.values()),
+        )
+        conn.commit()
+        conn.close()
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def check_ffmpeg():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        logger.error("FFmpeg/FFprobe not found in PATH.")
+        sys.exit(1)
+
+def sha256_file(path: Path) -> str:
+    """Calculate SHA256 hash efficiently."""
+    h = hashlib.sha256()
+    buffer_size = 1024 * 1024  # 1MB chunks
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(buffer_size):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "error_hashing"
+
+def get_media_info_ffprobe(path: Path) -> Dict[str, Any]:
+    """
+    Robust metadata extraction using ffprobe (JSON output).
+    Low memory overhead compared to pydub.
+    """
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", str(path)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        
+        # Extract Audio Stream
+        audio_stream = next((s for s in data.get('streams', []) if s['codec_type'] == 'audio'), {})
+        fmt = data.get('format', {})
+        
+        return {
+            "codec": audio_stream.get('codec_name', 'unknown'),
+            "sample_rate": int(audio_stream.get('sample_rate', 0)) if audio_stream.get('sample_rate') else 0,
+            "channels": int(audio_stream.get('channels', 0)) if audio_stream.get('channels') else 0,
+            "bit_depth": str(audio_stream.get('bits_per_sample', 'N/A')),
+            "duration": float(fmt.get('duration', 0)),
+            "format": fmt.get('format_long_name', 'unknown')
+        }
+    except Exception:
+        return {}
+
+# ── Core Worker Function ─────────────────────────────────────────────────────
+
+def process_file(file_info: Tuple[Path, Path]) -> Dict[str, Any]:
+    """
+    Worker function for ThreadPool. 
+    Handles: Hash -> Probe -> Convert -> Hash -> Return Result
+    """
+    input_path, output_path = file_info
+    rel_input = str(input_path.relative_to(INPUT_DIR))
+    rel_output = str(output_path.relative_to(OUTPUT_DIR))
+    
+    # Check resumption first
+    if is_already_converted(rel_input):
+        return {"status": "skipped", "path": rel_input}
+
+    try:
+        start_ts = datetime.now(timezone.utc).isoformat()
+        
+        # 1. Pre-computation (Metadata & Hash)
+        old_size = input_path.stat().st_size
+        sha_in = sha256_file(input_path)
+        meta_in = get_media_info_ffprobe(input_path)
+        
+        # 2. Conversion (Direct FFmpeg subprocess)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-ac", "1",        # Mono
+            "-ar", "16000",    # 16kHz
+            "-vn",             # No video
+            "-f", "wav",       # Force wav container
+            "-acodec", "pcm_s16le", # 16-bit PCM
+            str(output_path)
+        ]
+        
+        # subprocess.run blocks this thread, but releases GIL mostly
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        
+        # 3. Post-computation
+        new_size = output_path.stat().st_size
+        sha_out = sha256_file(output_path)
+        meta_out = get_media_info_ffprobe(output_path)
+        
+        record = {
+            "input_path": rel_input,
+            "output_path": rel_output,
+            "filename": input_path.name,
+            "status": "success",
+            "error_log": None,
+            # Source Meta
+            "old_size_bytes": old_size,
+            "old_format": input_path.suffix.lower().lstrip("."),
+            "old_codec": meta_in.get("codec"),
+            "old_sample_rate": meta_in.get("sample_rate"),
+            "old_bit_depth": meta_in.get("bit_depth"),
+            "old_channels": meta_in.get("channels"),
+            "old_duration_sec": meta_in.get("duration"),
+            # Target Meta
+            "new_size_bytes": new_size,
+            "new_format": "wav",
+            "new_codec": "pcm_s16le",
+            "new_sample_rate": 16000,
+            "new_bit_depth": 16,
+            "new_channels": 1,
+            "new_duration_sec": meta_out.get("duration"),
+            # Audit
+            "conversion_timestamp": start_ts,
+            "sha256_input": sha_in,
+            "sha256_output": sha_out
+        }
+        
+        upsert_record(record)
+        return {"status": "success", "path": rel_input}
+
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr.decode() if e.stderr else str(e)
+        # Log failure record
+        fail_record = {
+            "input_path": rel_input,
+            "output_path": rel_output,
+            "filename": input_path.name,
+            "status": "failed",
+            "error_log": err_msg,
+            # Basic info even on fail
+            "old_size_bytes": input_path.stat().st_size if input_path.exists() else 0,
+            "conversion_timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        upsert_record(fail_record)
+        return {"status": "failed", "path": rel_input, "error": err_msg}
+        
+    except Exception as e:
+        err_msg = traceback.format_exc()
+        fail_record = {
+            "input_path": rel_input,
+            "status": "failed",
+            "error_log": err_msg,
+            "old_size_bytes": 0,
+            "conversion_timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        upsert_record(fail_record)
+        return {"status": "failed", "path": rel_input, "error": err_msg}
+
+# ── Discovery ────────────────────────────────────────────────────────────────
+
+def discover_files(input_dir: Path) -> list[Tuple[Path, Path]]:
+    tasks = []
+    for root, _, files in os.walk(input_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() in AUDIO_EXTENSIONS:
+                in_path = Path(root) / fname
+                rel = in_path.relative_to(input_dir)
+                out_path = OUTPUT_DIR / rel.with_suffix(".wav")
+                tasks.append((in_path, out_path))
+    return tasks
+
+# ── Zipping (Chunked) ────────────────────────────────────────────────────────
+
+def run_zipping_phase():
+    """
+    Groups successful files by folder and zips them into 5GB chunks.
+    Includes manifests. Single-threaded to avoid disk thrashing.
+    """
+    logger.info("Starting Zipping Phase...")
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    
+    ZIP_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Get all success files
+    rows = conn.execute("SELECT * FROM conversions WHERE status='success'").fetchall()
+    
+    # Group by parent folder
+    groups = defaultdict(list)
+    for row in rows:
+        out_rel = row['output_path']
+        parent = str(Path(out_rel).parent)
+        if parent == ".": parent = "root"
+        groups[parent].append(row)
+        
+    for folder, files in groups.items():
+        files.sort(key=lambda r: r['filename']) # Deterministic order
+        
+        folder_clean = folder.replace(os.sep, "_").replace("/", "_")
+        chunk_idx = 1
+        current_chunk = []
+        current_size = 0
+        
+        def flush_chunk():
+            nonlocal chunk_idx, current_chunk, current_size
+            if not current_chunk: return
+            
+            size_gb = current_size / (1024**3)
+            zip_name = f"{folder_clean}_{chunk_idx}_{size_gb:.2f}GB.zip"
+            zip_path = ZIP_DIR / zip_name
+            man_name = f"manifest_{folder_clean}_{chunk_idx}.json"
+            
+            manifest_data = []
+            
+            logger.info(f"Creating Zip: {zip_name} ({len(current_chunk)} files)")
+            
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for row in current_chunk:
+                    # File
+                    abs_path = OUTPUT_DIR / row['output_path']
+                    if abs_path.exists():
+                        zf.write(abs_path, row['output_path'])
+                        
+                        # Manifest Entry
+                        manifest_data.append({
+                            "filename": row['filename'],
+                            "path": row['output_path'],
+                            "duration": row['new_duration_sec'],
+                            "orig_sha256": row['sha256_input'],
+                            "dest_sha256": row['sha256_output'],
+                            "meta": {
+                                "codec": row['new_codec'],
+                                "rate": row['new_sample_rate']
+                            }
+                        })
+                
+                # Write Manifest
+                zf.writestr(man_name, json.dumps({
+                    "zip_name": zip_name,
+                    "created": datetime.now().isoformat(),
+                    "files": manifest_data
+                }, indent=2))
+                
+            # Record zip in DB
+            conn.execute(
+                "INSERT INTO zip_files (zip_name, parent_folder, zip_index, size_bytes, file_count, manifest_name, run_timestamp) VALUES (?,?,?,?,?,?,?)",
+                (zip_name, folder, chunk_idx, zip_path.stat().st_size, len(current_chunk), man_name, RUN_STAMP)
+            )
+            conn.commit()
+            
+            chunk_idx += 1
+            current_chunk = []
+            current_size = 0
+
+        for row in files:
+            fsize = row['new_size_bytes'] or 0
+            if current_size + fsize > MAX_ZIP_BYTES:
+                flush_chunk()
+            current_chunk.append(row)
+            current_size += fsize
+            
+        flush_chunk() # Last chunk
+        
+    conn.close()
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    logger.info(f"System: Ryzen 9 7950X3D Optimization Enabled")
+    logger.info(f"Threads: {MAX_WORKERS} | Memory Target: ~150GB Safe Limit")
+    
+    check_ffmpeg()
+    init_db(DB_PATH)
+    
+    # 1. Discovery
+    all_tasks = discover_files(INPUT_DIR)
+    logger.info(f"Found {len(all_tasks)} audio files.")
+    
+    if not all_tasks:
+        logger.info("No files to process.")
+        return
+
+    # 2. Parallel Processing
+    logger.info("Starting Parallel Conversion Pool...")
+    
+    success_cnt = 0
+    fail_cnt = 0
+    skip_cnt = 0
+    
+    # Using ThreadPoolExecutor with MAX_WORKERS
+    # We use Threads instead of Processes because:
+    # 1. IO Bound: FFmpeg subprocesses do the heavy CPU lifting (outside python GIL).
+    # 2. Memory: Threads share memory, preventing 28x python interpreter overhead.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_file, task): task for task in all_tasks}
+        
+        # Monitor progress
+        total = len(all_tasks)
+        for i, future in enumerate(as_completed(futures), 1):
+            res = future.result()
+            status = res['status']
+            
+            if status == "success": success_cnt += 1
+            elif status == "failed": 
+                fail_cnt += 1
+                logger.error(f"Failed: {res['path']} | {res.get('error', '')[:100]}")
+            elif status == "skipped": skip_cnt += 1
+            
+            if i % 100 == 0:
+                print(f"Progress: {i}/{total} (Success: {success_cnt} | Skip: {skip_cnt} | Fail: {fail_cnt})", end="\r")
+                
+    print("\nProcessing complete.")
+    logger.info(f"Final Stats: {success_cnt} Converted, {skip_cnt} Skipped, {fail_cnt} Failed")
+    
+    # 3. Zipping
+    run_zipping_phase()
+    
+    logger.info(f"Run {RUN_STAMP} Finished.")
+
+if __name__ == "__main__":
+    main()
